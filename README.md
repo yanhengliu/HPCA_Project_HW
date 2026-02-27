@@ -1,74 +1,116 @@
 # Hull–White 1F Monte Carlo on GPU (CUDA)
 
-CUDA implementation of a Monte Carlo engine for the Hull–White one-factor short-rate model, covering curve construction, option pricing, and sensitivity (vega) estimation for a zero-coupon bond call (ZBC). This project follows the 2026 assignment statement for “Monte Carlo simulation of Hull-White model and sensitivities computation (Q1–Q3)”. :contentReference[oaicite:0]{index=0}
+CUDA implementation of a Monte Carlo engine for the Hull–White one-factor short-rate model. The code builds the zero-coupon curve and forward curve on a uniform time grid, prices a zero-coupon bond call (ZBC), and estimates the ZBC vega with a pathwise (tangent) method and a finite-difference check.
 
 ---
 
 ## Model
 
 Hull–White one-factor short rate:
-\[
-dr(t) = (\theta(t) - a\,r(t))dt + \sigma\,dW_t,\quad r(0)=0.012
-\]
 
-- Mean reversion: `a = 1.0`
-- Volatility: `sigma = 0.1`
-- Time horizon: `T_max = 10`
-- Uniform grid with `nSteps` points (`dt = T_max/(nSteps-1)`)
+$$
+dr(t) = \big(\theta(t) - a\,r(t)\big)\,dt + \sigma\,dW_t,\qquad r(0)=r_0
+$$
 
-The time integral \(\int r\,ds\) is approximated with the trapezoidal rule on the uniform grid. :contentReference[oaicite:1]{index=1}
+Mean reversion: \(a = 1.0\)  
+Volatility: \(\sigma = 0.1\)  
+Initial short rate: \(r_0 = 0.012\)  
+Time horizon: \(T_{\max} = 10\)  
+Uniform grid: \(n_{\text{steps}}\) points with \(dt = \frac{T_{\max}}{n_{\text{steps}}-1}\)
+
+The integral \(\int r_s\,ds\) is approximated with the trapezoidal rule on the uniform grid.
 
 ---
 
 ## What the program computes
 
 ### Q1 — Curve construction (Monte Carlo)
-For maturities \(T \in [0,10]\), compute:
-- Zero-coupon curve \(P(0,T) = \mathbb{E}[\exp(-\int_0^T r_s ds)]\)
-- Forward curve \(f(0,T) = -\partial_T \ln P(0,T)\)
 
-### Q2 — Theta recovery + ZBC pricing
-Using the curves from Q1 (same discretization):
-- **(a)** Recover \(\theta(T)\) from \(f(0,T)\) using:
-  \[
-  \theta(T) = \partial_T f(0,T) + a f(0,T) + \frac{\sigma^2(1-e^{-2aT})}{2a}
-  \]
-- **(b)** Price the European call on a zero-coupon bond:
-  \[
-  ZBC(S_1,S_2,K)=\mathbb{E}\left[e^{-\int_0^{S_1} r_s ds}\,(P(S_1,S_2)-K)_+\right]
-  \]
-  with the assignment setup: `S1=5`, `S2=10`, `K=exp(-0.1)`.
+For maturities \(T \in [0,10]\), estimate:
 
-### Q3 — Vega of ZBC (two methods)
-Assuming \(\{P(0,T)\}\) and \(\{f(0,T)\}\) are **fixed market data**:
-- **Pathwise / tangent method** on GPU (propagates \(u(t)=\partial_\sigma r(t)\) using the same Gaussian increments as the rate simulation)
-- **Finite difference** baseline with common random numbers:
-  \[
-  \frac{ZBC(\sigma+h)-ZBC(\sigma-h)}{2h}
-  \]
+$$
+P(0,T) = \mathbb{E}\left[\exp\left(-\int_0^T r_s\,ds\right)\right]
+$$
 
-All of the above match the formulas and intent described in the statement. :contentReference[oaicite:2]{index=2}
+and the forward curve from the bond curve:
+
+$$
+f(0,T) = -\frac{d}{dT}\ln P(0,T)
+$$
+
+Finite differences are used on the time grid (forward/backward at boundaries, central inside).
 
 ---
 
-## Implementation notes (high level)
+### Q2 — Theta recovery and ZBC pricing
 
-- **One GPU thread = one Monte Carlo path** over the whole time grid.
-- **cuRAND Philox** (`curandStatePhilox4_32_10_t`) for per-path RNG.
-- Deterministic terms are **precomputed on CPU once** and uploaded:
-  - `theta(t_k)` on the grid
-  - step drift integral used in the conditional Gaussian transition
-- Monte Carlo totals are accumulated using `atomicAdd` into global sums.
-- For Q3 (“market data fixed”), `theta` is rebuilt from the fixed forward curve via Eq.(10), which makes it depend on `sigma`.
+Theta recovery from the forward curve uses:
+
+$$
+\theta(T) = \frac{d}{dT}f(0,T) + a\,f(0,T) + \frac{\sigma^2\big(1-e^{-2aT}\big)}{2a}
+$$
+
+The ZBC option priced is a European call on a zero-coupon bond:
+
+$$
+\mathrm{ZBC}(S_1,S_2,K)=
+\mathbb{E}\left[
+\exp\left(-\int_0^{S_1} r_s\,ds\right)\,
+\big(P(S_1,S_2)-K\big)_+
+\right]
+$$
+
+Assignment setup used in `main`:
+
+\(S_1 = 5\)  
+\(S_2 = 10\)  
+\(K = e^{-0.1}\)
+
+Bond pricing under Hull–White uses the analytic form:
+
+$$
+P(t,T) = A(t,T)\,\exp\big(-B(t,T)\,r(t)\big),\qquad
+B(t,T)=\frac{1-e^{-a(T-t)}}{a}
+$$
+
+---
+
+### Q3 — Vega of ZBC (two methods)
+
+Market data are treated as fixed: the curves \(P(0,T)\) and \(f(0,T)\) from Q1 stay unchanged.
+
+Method 1: pathwise / tangent vega on GPU, propagating \(u(t)=\partial_\sigma r(t)\) using the same Gaussian increments as the rate simulation.
+
+Method 2: central finite difference with common random numbers:
+
+$$
+\partial_\sigma \mathrm{ZBC} \approx
+\frac{\mathrm{ZBC}(\sigma+h)-\mathrm{ZBC}(\sigma-h)}{2h}
+$$
+
+---
+
+## Implementation summary
+
+One GPU thread simulates one full short-rate path.
+
+Deterministic terms are precomputed on CPU and uploaded once per run: \(\theta(t_k)\) on the grid and the one-step drift integral used in the conditional Gaussian transition.
+
+Random numbers are generated per path using cuRAND Philox (`curandStatePhilox4_32_10_t`).
+
+Monte Carlo totals are accumulated with `atomicAdd` into global sums.
 
 ---
 
 ## Build
 
-Requirements:
-- NVIDIA GPU + CUDA toolkit (nvcc)
-- A supported compute capability (set `-arch=` accordingly)
-
 Example:
+
 ```bash
-nvcc -O3 -arch=sm_75 HWbuilt.cu -o HW
+nvcc -arch=sm_75 HWbuilt.cu -o HW
+```
+
+## Run
+```bash
+./HW
+```
